@@ -111,7 +111,7 @@ class DupeCheckerApp:
             if sys.platform == "win32":
                 os.startfile(folder)
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
+                subprocess.run(['explorer', '/select,', os.path.normpath(full_path)])
             else:
                 subprocess.Popen(["xdg-open", folder])
         else:
