@@ -31,15 +31,6 @@ def format_size(num_bytes):
     except:
         return str(num_bytes)
 
-def format_duration(seconds):
-    try:
-        seconds = int(float(seconds))
-        m, s = divmod(seconds, 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
-    except:
-        return "0:00"
-
 class DupeCheckerApp:
     def __init__(self, root):
         self.root = root
@@ -79,11 +70,6 @@ class DupeCheckerApp:
         for col in columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=200, anchor="w")
-
-        # Set row height to prevent image overlap
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=PREVIEW_HEIGHT + 10)
-
         self.tree.pack(fill="both", expand=True)
 
         self.tree.bind("<Button-3>", self.show_context_menu)
@@ -98,23 +84,22 @@ class DupeCheckerApp:
             self.menu.post(event.x_root, event.y_root)
 
     def open_file_location(self):
-    selected = self.tree.selection()
-    if not selected:
-        return
-    item = selected[0]
-    path = self.tree.item(item, "values")[1]
-    name = self.tree.item(item, "values")[0]
-    full_path = path if os.path.isfile(path) else os.path.join(path, name)
-    if os.path.exists(full_path):
-        if sys.platform == "win32":
-            subprocess.run(['explorer', '/select,', os.path.normpath(full_path)])
-        elif sys.platform == "darwin":
-            subprocess.run(["open", "-R", full_path])
+        selected = self.tree.selection()
+        if not selected:
+            return
+        item = selected[0]
+        path = self.tree.item(item, "values")[1]
+        name = self.tree.item(item, "values")[0]
+        full_path = os.path.join(path, name)
+        if os.path.exists(full_path):
+            if sys.platform == "win32":
+                subprocess.run(['explorer', '/select,', full_path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", full_path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(full_path)])
         else:
-            folder = os.path.dirname(full_path)
-            subprocess.run(["xdg-open", folder])
-    else:
-        messagebox.showwarning("Warning", "Path does not exist")
+            messagebox.showwarning("Warning", "Path does not exist")
 
     def start_import(self):
         if self.import_cancelled == False and self.import_thread_is_alive():
@@ -166,56 +151,25 @@ class DupeCheckerApp:
             self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
             return
 
-        # Detect duplicates by size or name
         size_map = {}
-        name_map = {}
         for d in self.data:
             size_map.setdefault(d['Size'], []).append(d)
-            name_map.setdefault(d['Name'].lower(), []).append(d)
 
         duplicates_set = set()
-
         for size, files in size_map.items():
-            if len(files) > 1:
-                duplicates_set.update(map(id, files))
-        for name, files in name_map.items():
             if len(files) > 1:
                 duplicates_set.update(map(id, files))
 
         self.duplicates = [d for d in self.data if id(d) in duplicates_set]
 
-        # Get durations for duplicates (slow but needed)
         for i, d in enumerate(self.duplicates):
-            if self.import_cancelled:
-                self.root.after(0, lambda: self.status_var.set("CSV import cancelled"))
-                self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
-                return
-            full_path = os.path.join(d['Path'], d['Name'])
-            d['Duration'] = self.get_duration(full_path)
+            d['Duration'], d['Timecode'] = self.get_duration_and_timecode(d['Path'], d['Name'])
             if i % 20 == 0:
                 self.root.after(0, lambda i=i: self.status_var.set(f"Processed {i}/{len(self.duplicates)} duplicates..."))
 
         self.root.after(0, self.populate_treeview)
         self.root.after(0, lambda: self.status_var.set(f"Import complete. {len(self.duplicates)} duplicates found"))
         self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
-
-    def get_duration(self, filepath):
-        if not os.path.isfile(filepath):
-            return "Unknown"
-        try:
-            result = subprocess.run(
-                [FFPROBE_PATH, "-v", "error", "-show_entries",
-                 "format=duration", "-of",
-                 "default=noprint_wrappers=1:nokey=1", filepath],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=STARTUPINFO.dwFlags if STARTUPINFO else 0
-            )
-            seconds = float(result.stdout)
-            m, s = divmod(int(seconds), 60)
-            h, m = divmod(m, 60)
-            return f"{h}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
-        except:
-            return "Unknown"
 
     def populate_treeview(self):
         self.tree_images.clear()
@@ -259,12 +213,8 @@ class DupeCheckerApp:
             values = self.tree.item(item, "values")
             name, path = values[0], values[1]
             full_path = os.path.join(path, name)
-            if not os.path.isfile(full_path):
-                continue
-            # Get half duration timecode for ffmpeg seek
-            duration_seconds = self.get_duration_seconds(full_path)
-            seek_time = max(duration_seconds / 2, 1)
-            img = self.get_preview_image(full_path, seek_time)
+            timecode = next((d['Timecode'] for d in self.duplicates if d['Name'] == name and d['Path'] == path), "00:00:01")
+            img = self.get_preview_image(full_path, timecode)
             if img:
                 self.tree_images[item] = img
                 self.root.after(0, lambda i=item, photo=img: self.tree.item(i, image=photo))
@@ -272,37 +222,38 @@ class DupeCheckerApp:
         self.root.after(0, lambda: self.status_var.set("Preview generation completed"))
         self.root.after(0, lambda: self.cancel_preview_btn.config(state="disabled"))
 
-    def get_duration_seconds(self, filepath):
-        if not os.path.isfile(filepath):
-            return 0
+    def get_duration_and_timecode(self, path, filename):
+        full_path = os.path.join(path, filename)
+        if not os.path.isfile(full_path):
+            return "Unknown", "00:00:01"
         try:
-            result = subprocess.run(
-                [FFPROBE_PATH, "-v", "error", "-show_entries",
-                 "format=duration", "-of",
-                 "default=noprint_wrappers=1:nokey=1", filepath],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=STARTUPINFO.dwFlags if STARTUPINFO else 0
-            )
-            seconds = float(result.stdout)
-            return seconds
+            duration_raw = subprocess.check_output([
+                FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                full_path
+            ], stderr=subprocess.DEVNULL, startupinfo=STARTUPINFO).decode().strip()
+            total_seconds = int(float(duration_raw))
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+            duration = f"{hours:02}:{minutes:02}:{seconds:02}" if hours > 0 else f"{minutes:02}:{seconds:02}"
+            half = total_seconds // 2
+            hh, mm, ss = half // 3600, (half % 3600) // 60, half % 60
+            return duration, f"{hh:02}:{mm:02}:{ss:02}"
         except:
-            return 0
+            return "Unknown", "00:00:01"
 
-    def get_preview_image(self, filepath, seek_seconds):
-        seek_time = str(int(seek_seconds))
+    def get_preview_image(self, full_path, timecode):
         try:
-            ffmpeg_cmd = [FFMPEG_PATH, "-i", filepath, "-ss", seek_time,
-                          "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
-            image_data = subprocess.check_output(
-                ffmpeg_cmd,
-                stderr=subprocess.DEVNULL,
-                startupinfo=STARTUPINFO
-            )
+            ffmpeg_cmd = [
+                FFMPEG_PATH, "-ss", timecode, "-i", full_path, "-frames:v", "1",
+                "-f", "image2pipe", "-vcodec", "mjpeg", "-"
+            ]
+            image_data = subprocess.check_output(ffmpeg_cmd, stderr=subprocess.DEVNULL, startupinfo=STARTUPINFO)
             image = Image.open(io.BytesIO(image_data))
             image = image.resize((PREVIEW_WIDTH, PREVIEW_HEIGHT), Image.Resampling.LANCZOS)
             return ImageTk.PhotoImage(image)
-        except Exception as e:
-            # Could log or print(e) here if debugging
+        except:
             return None
 
 if __name__ == "__main__":
