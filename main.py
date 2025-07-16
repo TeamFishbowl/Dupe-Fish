@@ -79,6 +79,11 @@ class DupeCheckerApp:
         for col in columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=200, anchor="w")
+
+        # Set row height to prevent image overlap
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=PREVIEW_HEIGHT + 10)
+
         self.tree.pack(fill="both", expand=True)
 
         self.tree.bind("<Button-3>", self.show_context_menu)
@@ -97,9 +102,12 @@ class DupeCheckerApp:
         if not selected:
             return
         item = selected[0]
-        path = self.tree.item(item, "values")[1]
-        if os.path.exists(path):
-            folder = os.path.dirname(path)
+        values = self.tree.item(item, "values")
+        name = values[0]
+        path = values[1]
+        full_path = os.path.join(path, name)
+        if os.path.exists(full_path):
+            folder = os.path.dirname(full_path)
             if sys.platform == "win32":
                 os.startfile(folder)
             elif sys.platform == "darwin":
@@ -107,7 +115,7 @@ class DupeCheckerApp:
             else:
                 subprocess.Popen(["xdg-open", folder])
         else:
-            messagebox.showwarning("Warning", "Path does not exist")
+            messagebox.showwarning("Warning", "File does not exist")
 
     def start_import(self):
         if self.import_cancelled == False and self.import_thread_is_alive():
@@ -183,7 +191,8 @@ class DupeCheckerApp:
                 self.root.after(0, lambda: self.status_var.set("CSV import cancelled"))
                 self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
                 return
-            d['Duration'] = self.get_duration(d['Path'])
+            full_path = os.path.join(d['Path'], d['Name'])
+            d['Duration'] = self.get_duration(full_path)
             if i % 20 == 0:
                 self.root.after(0, lambda i=i: self.status_var.set(f"Processed {i}/{len(self.duplicates)} duplicates..."))
 
@@ -250,7 +259,7 @@ class DupeCheckerApp:
                 return
             values = self.tree.item(item, "values")
             name, path = values[0], values[1]
-            full_path = path if os.path.isfile(path) else os.path.join(path, name)
+            full_path = os.path.join(path, name)
             if not os.path.isfile(full_path):
                 continue
             # Get half duration timecode for ffmpeg seek
