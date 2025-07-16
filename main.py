@@ -49,6 +49,9 @@ class DupeCheckerApp:
         self.setup_gui()
 
     def setup_gui(self):
+        style = ttk.Style(self.root)
+        style.configure("Treeview", rowheight=PREVIEW_HEIGHT)
+
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(fill="x", pady=5)
 
