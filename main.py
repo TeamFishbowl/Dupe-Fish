@@ -98,24 +98,23 @@ class DupeCheckerApp:
             self.menu.post(event.x_root, event.y_root)
 
     def open_file_location(self):
-        selected = self.tree.selection()
-        if not selected:
-            return
-        item = selected[0]
-        values = self.tree.item(item, "values")
-        name = values[0]
-        path = values[1]
-        full_path = os.path.join(path, name)
-        if os.path.exists(full_path):
-            folder = os.path.dirname(full_path)
-            if sys.platform == "win32":
-                os.startfile(folder)
-            elif sys.platform == "darwin":
-                subprocess.run(['explorer', '/select,', os.path.normpath(full_path)])
-            else:
-                subprocess.Popen(["xdg-open", folder])
+    selected = self.tree.selection()
+    if not selected:
+        return
+    item = selected[0]
+    path = self.tree.item(item, "values")[1]
+    name = self.tree.item(item, "values")[0]
+    full_path = path if os.path.isfile(path) else os.path.join(path, name)
+    if os.path.exists(full_path):
+        if sys.platform == "win32":
+            subprocess.run(['explorer', '/select,', os.path.normpath(full_path)])
+        elif sys.platform == "darwin":
+            subprocess.run(["open", "-R", full_path])
         else:
-            messagebox.showwarning("Warning", "File does not exist")
+            folder = os.path.dirname(full_path)
+            subprocess.run(["xdg-open", folder])
+    else:
+        messagebox.showwarning("Warning", "Path does not exist")
 
     def start_import(self):
         if self.import_cancelled == False and self.import_thread_is_alive():
