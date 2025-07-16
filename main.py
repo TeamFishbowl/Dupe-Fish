@@ -292,7 +292,7 @@ class DupeCheckerApp:
     def get_preview_image(self, filepath, seek_seconds):
         seek_time = str(int(seek_seconds))
         try:
-            ffmpeg_cmd = [FFMPEG_PATH, "-ss", seek_time, "-i", filepath,
+            ffmpeg_cmd = [FFMPEG_PATH, "-i", filepath, "-ss", seek_time,
                           "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
             image_data = subprocess.check_output(
                 ffmpeg_cmd,
