@@ -1,53 +1,90 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import threading
+from tkinter import filedialog, ttk, messagebox
 import csv
 import os
 import subprocess
-import webbrowser
 from PIL import Image, ImageTk
+import io
+import threading
+import sys
 
 PREVIEW_WIDTH = 240
 PREVIEW_HEIGHT = 135
 
+STARTUPINFO = None
+if sys.platform == "win32":
+    STARTUPINFO = subprocess.STARTUPINFO()
+    STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+APP_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)
+FFMPEG_PATH = os.path.join(APP_DIR, "ffmpeg.exe")
+FFPROBE_PATH = os.path.join(APP_DIR, "ffprobe.exe")
+
+def format_size(num_bytes):
+    try:
+        size = float(num_bytes)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} PB"
+    except:
+        return str(num_bytes)
+
+def format_duration(seconds):
+    try:
+        seconds = int(float(seconds))
+        m, s = divmod(seconds, 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+    except:
+        return "0:00"
+
 class DupeCheckerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Dupe Checker")
+        self.root.title("Duplicate Media Checker")
+        self.root.geometry("1100x600")
 
+        self.data = []
         self.duplicates = []
-        self.preview_index = 0
+        self.tree_images = {}
 
-        self.csv_cancelled = False
+        self.import_cancelled = False
         self.preview_cancelled = False
 
-        self.preview_images = {}  # indexed by row
+        self.status_var = tk.StringVar(value="Ready")
+
         self.setup_gui()
 
     def setup_gui(self):
         btn_frame = tk.Frame(self.root)
-        btn_frame.pack(pady=10)
+        btn_frame.pack(fill="x", pady=5)
 
-        tk.Button(btn_frame, text="Import CSV", command=self.import_csv).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel CSV Import", command=self.cancel_csv_import).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Generate Previews", command=self.generate_previews).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel Image Preview Generation", command=self.cancel_preview_generation).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Import CSV", command=self.start_import).pack(side="left", padx=5)
+        self.cancel_import_btn = tk.Button(btn_frame, text="Cancel Import", command=self.cancel_import, state="disabled")
+        self.cancel_import_btn.pack(side="left", padx=5)
 
-        self.status_label = tk.Label(self.root, text="Status: Ready")
-        self.status_label.pack(pady=5)
+        tk.Button(btn_frame, text="Generate Previews", command=self.start_generate_previews).pack(side="left", padx=5)
+        self.cancel_preview_btn = tk.Button(btn_frame, text="Cancel Preview", command=self.cancel_preview, state="disabled")
+        self.cancel_preview_btn.pack(side="left", padx=5)
 
-        columns = ("name", "path", "size", "duration", "preview")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=20)
-        self.tree.pack(fill=tk.BOTH, expand=True)
+        status_label = tk.Label(self.root, textvariable=self.status_var, anchor="w")
+        status_label.pack(fill="x", padx=5)
 
-        for col, w in zip(columns, [200, 300, 100, 100, 80]):
-            self.tree.heading(col, text=col.capitalize())
-            self.tree.column(col, width=w)
+        columns = ("Name", "Path", "Size", "Duration")
+        self.tree = ttk.Treeview(self.root, columns=columns, show="tree headings")
+        self.tree.heading("#0", text="Preview")
+        self.tree.column("#0", width=PREVIEW_WIDTH, stretch=False)
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=200, anchor="w")
+        self.tree.pack(fill="both", expand=True)
+
+        self.tree.bind("<Button-3>", self.show_context_menu)
 
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Open in Explorer", command=self.open_in_explorer)
-        self.tree.bind("<Button-3>", self.show_context_menu)
-        self.tree.bind("<Double-1>", self.on_double_click)
+        self.menu.add_command(label="Open File Location", command=self.open_file_location)
 
     def show_context_menu(self, event):
         iid = self.tree.identify_row(event.y)
@@ -55,163 +92,210 @@ class DupeCheckerApp:
             self.tree.selection_set(iid)
             self.menu.post(event.x_root, event.y_root)
 
-    def open_in_explorer(self):
+    def open_file_location(self):
         selected = self.tree.selection()
-        if selected:
-            path = self.tree.item(selected[0], "values")[1]
-            folder = os.path.dirname(path)
-            webbrowser.open(f'file:///{folder}')
-
-    def on_double_click(self, event):
-        item = self.tree.identify_row(event.y)
-        if item:
-            index = self.tree.index(item)
-            if index in self.preview_images:
-                self.show_image_popup(self.preview_images[index])
-
-    def show_image_popup(self, photo):
-        top = tk.Toplevel(self.root)
-        top.title("Preview")
-        lbl = tk.Label(top, image=photo)
-        lbl.image = photo
-        lbl.pack()
-
-    # CSV Import
-    def import_csv(self):
-        file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
-        if file_path:
-            self.duplicates.clear()
-            self.preview_images.clear()
-            self.preview_index = 0
-            self.tree.delete(*self.tree.get_children())
-            self.csv_cancelled = False
-            threading.Thread(target=self.load_csv, args=(file_path,)).start()
-
-    def cancel_csv_import(self):
-        self.csv_cancelled = True
-
-    def load_csv(self, file_path):
-        seen_names = set()
-        seen_sizes = set()
-        count = 0
-        with open(file_path, newline='', encoding='utf-8') as csvfile:
-            reader = csv.reader(csvfile)
-            for row in reader:
-                if self.csv_cancelled:
-                    self.update_status("CSV import cancelled.")
-                    return
-                if len(row) < 3:
-                    continue
-                name, path, size_str = row[0].strip(), row[1].strip(), row[2].strip()
-                try:
-                    size = int(size_str)
-                except:
-                    size = 0
-                duration = self.get_duration(path)
-                if name in seen_names or size_str in seen_sizes:
-                    self.duplicates.append({"name": name, "path": path, "size": size, "duration": duration})
-                    self.root.after(0, self.insert_tree_item, name, path, size, duration, "")
-                seen_names.add(name)
-                seen_sizes.add(size_str)
-                count += 1
-                if count % 50 == 0:
-                    self.update_status(f"Imported {count} lines...")
-        self.update_status(f"CSV load completed. Total: {count}")
-
-    def insert_tree_item(self, name, path, size, duration, preview):
-        self.tree.insert("", tk.END, values=(
-            name,
-            path,
-            self.format_size(size),
-            self.format_duration(duration),
-            preview
-        ))
-
-    # Preview Generation
-    def generate_previews(self):
-        if not self.duplicates:
-            messagebox.showinfo("Info", "No duplicates loaded.")
+        if not selected:
             return
-        self.preview_cancelled = False
-        threading.Thread(target=self._generate_previews).start()
+        item = selected[0]
+        path = self.tree.item(item, "values")[1]
+        if os.path.exists(path):
+            folder = os.path.dirname(path)
+            if sys.platform == "win32":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        else:
+            messagebox.showwarning("Warning", "Path does not exist")
 
-    def cancel_preview_generation(self):
-        self.preview_cancelled = True
+    def start_import(self):
+        if self.import_cancelled == False and self.import_thread_is_alive():
+            messagebox.showinfo("Info", "Import already running")
+            return
+        file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+        if not file_path:
+            return
+        self.import_cancelled = False
+        self.cancel_import_btn.config(state="normal")
+        self.status_var.set("Starting CSV import...")
+        self.data.clear()
+        self.duplicates.clear()
+        self.tree_images.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.import_thread = threading.Thread(target=self.import_csv_worker, args=(file_path,), daemon=True)
+        self.import_thread.start()
 
-    def _generate_previews(self):
-        total = len(self.duplicates)
-        while self.preview_index < total:
-            if self.preview_cancelled:
-                self.update_status(f"Preview generation cancelled at {self.preview_index}/{total}")
+    def import_thread_is_alive(self):
+        return hasattr(self, "import_thread") and self.import_thread.is_alive()
+
+    def cancel_import(self):
+        if self.import_thread_is_alive():
+            self.import_cancelled = True
+            self.status_var.set("Cancelling CSV import...")
+            self.cancel_import_btn.config(state="disabled")
+
+    def import_csv_worker(self, file_path):
+        try:
+            with open(file_path, newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for i, row in enumerate(reader):
+                    if self.import_cancelled:
+                        self.root.after(0, lambda: self.status_var.set("CSV import cancelled"))
+                        self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
+                        return
+                    try:
+                        row['Size'] = float(row['Size'])
+                        row['Name'] = row['Name'].strip()
+                        row['Path'] = row['Path'].strip()
+                    except:
+                        continue
+                    self.data.append(row)
+                    if i % 100 == 0:
+                        self.root.after(0, lambda i=i: self.status_var.set(f"Imported {i} rows..."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to import CSV:\n{e}"))
+            self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
+            return
+
+        # Detect duplicates by size or name
+        size_map = {}
+        name_map = {}
+        for d in self.data:
+            size_map.setdefault(d['Size'], []).append(d)
+            name_map.setdefault(d['Name'].lower(), []).append(d)
+
+        duplicates_set = set()
+
+        for size, files in size_map.items():
+            if len(files) > 1:
+                duplicates_set.update(map(id, files))
+        for name, files in name_map.items():
+            if len(files) > 1:
+                duplicates_set.update(map(id, files))
+
+        self.duplicates = [d for d in self.data if id(d) in duplicates_set]
+
+        # Get durations for duplicates (slow but needed)
+        for i, d in enumerate(self.duplicates):
+            if self.import_cancelled:
+                self.root.after(0, lambda: self.status_var.set("CSV import cancelled"))
+                self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
                 return
-            file = self.duplicates[self.preview_index]
-            preview_path = f"preview_{self.preview_index}.jpg"
-            halfway = float(file["duration"])/2 if file["duration"] else 1
-            self.extract_frame(file["path"], preview_path, halfway)
-            try:
-                img = Image.open(preview_path).resize((PREVIEW_WIDTH, PREVIEW_HEIGHT))
-                photo = ImageTk.PhotoImage(img)
-                self.preview_images[self.preview_index] = photo
-                self.root.after(0, self.update_tree_preview, self.preview_index, "✔")
-            except:
-                pass
-            self.preview_index += 1
-            if self.preview_index % 5 == 0:
-                self.update_status(f"Generated {self.preview_index}/{total} previews")
-        self.update_status("Preview generation completed.")
+            d['Duration'] = self.get_duration(d['Path'])
+            if i % 20 == 0:
+                self.root.after(0, lambda i=i: self.status_var.set(f"Processed {i}/{len(self.duplicates)} duplicates..."))
 
-    def update_tree_preview(self, index, preview_mark):
-        iid = self.tree.get_children()[index]
-        values = list(self.tree.item(iid, "values"))
-        values[4] = preview_mark
-        self.tree.item(iid, values=values)
+        self.root.after(0, self.populate_treeview)
+        self.root.after(0, lambda: self.status_var.set(f"Import complete. {len(self.duplicates)} duplicates found"))
+        self.root.after(0, lambda: self.cancel_import_btn.config(state="disabled"))
 
-    # Utilities
-    def format_size(self, size):
+    def get_duration(self, filepath):
+        if not os.path.isfile(filepath):
+            return "Unknown"
         try:
-            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-                if size < 1024:
-                    return f"{size:.2f} {unit}"
-                size /= 1024
-            return f"{size:.2f} PB"
-        except:
-            return str(size)
-
-    def format_duration(self, seconds):
-        try:
-            seconds = int(float(seconds))
-            m, s = divmod(seconds, 60)
+            result = subprocess.run(
+                [FFPROBE_PATH, "-v", "error", "-show_entries",
+                 "format=duration", "-of",
+                 "default=noprint_wrappers=1:nokey=1", filepath],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=STARTUPINFO.dwFlags if STARTUPINFO else 0
+            )
+            seconds = float(result.stdout)
+            m, s = divmod(int(seconds), 60)
             h, m = divmod(m, 60)
             return f"{h}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
         except:
-            return "0:00"
+            return "Unknown"
 
-    def get_duration(self, filepath):
+    def populate_treeview(self):
+        self.tree_images.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for d in self.duplicates:
+            item = self.tree.insert("", tk.END, text="", image="", values=(
+                d['Name'],
+                d['Path'],
+                format_size(d['Size']),
+                d.get('Duration', 'Unknown'),
+            ))
+
+    def start_generate_previews(self):
+        if not self.duplicates:
+            messagebox.showinfo("Info", "No duplicates loaded to generate previews.")
+            return
+        if self.preview_cancelled == False and hasattr(self, "preview_thread") and self.preview_thread.is_alive():
+            messagebox.showinfo("Info", "Preview generation already running")
+            return
+        self.preview_cancelled = False
+        self.cancel_preview_btn.config(state="normal")
+        self.status_var.set("Starting preview generation...")
+        self.preview_thread = threading.Thread(target=self.generate_previews_worker, daemon=True)
+        self.preview_thread.start()
+
+    def cancel_preview(self):
+        if hasattr(self, "preview_thread") and self.preview_thread.is_alive():
+            self.preview_cancelled = True
+            self.status_var.set("Cancelling preview generation...")
+            self.cancel_preview_btn.config(state="disabled")
+
+    def generate_previews_worker(self):
+        items = self.tree.get_children()
+        total = len(items)
+        for i, item in enumerate(items):
+            if self.preview_cancelled:
+                self.root.after(0, lambda: self.status_var.set(f"Preview generation cancelled at {i}/{total}"))
+                self.root.after(0, lambda: self.cancel_preview_btn.config(state="disabled"))
+                return
+            values = self.tree.item(item, "values")
+            name, path = values[0], values[1]
+            full_path = path if os.path.isfile(path) else os.path.join(path, name)
+            if not os.path.isfile(full_path):
+                continue
+            # Get half duration timecode for ffmpeg seek
+            duration_seconds = self.get_duration_seconds(full_path)
+            seek_time = max(duration_seconds / 2, 1)
+            img = self.get_preview_image(full_path, seek_time)
+            if img:
+                self.tree_images[item] = img
+                self.root.after(0, lambda i=item, photo=img: self.tree.item(i, image=photo))
+            self.root.after(0, lambda i=i: self.status_var.set(f"Generated previews: {i+1}/{total}"))
+        self.root.after(0, lambda: self.status_var.set("Preview generation completed"))
+        self.root.after(0, lambda: self.cancel_preview_btn.config(state="disabled"))
+
+    def get_duration_seconds(self, filepath):
+        if not os.path.isfile(filepath):
+            return 0
         try:
             result = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries",
+                [FFPROBE_PATH, "-v", "error", "-show_entries",
                  "format=duration", "-of",
                  "default=noprint_wrappers=1:nokey=1", filepath],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=STARTUPINFO.dwFlags if STARTUPINFO else 0
             )
-            return float(result.stdout.strip())
+            seconds = float(result.stdout)
+            return seconds
         except:
             return 0
 
-    def extract_frame(self, filepath, output, timestamp):
+    def get_preview_image(self, filepath, seek_seconds):
+        seek_time = str(int(seek_seconds))
         try:
-            subprocess.run(
-                ["ffmpeg", "-ss", str(timestamp), "-i", filepath,
-                 "-vframes", "1", "-s", f"{PREVIEW_WIDTH}x{PREVIEW_HEIGHT}", "-y", output],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW
+            ffmpeg_cmd = [FFMPEG_PATH, "-ss", seek_time, "-i", filepath,
+                          "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+            image_data = subprocess.check_output(
+                ffmpeg_cmd,
+                stderr=subprocess.DEVNULL,
+                startupinfo=STARTUPINFO
             )
-        except:
-            pass
-
-    def update_status(self, msg):
-        self.root.after(0, self.status_label.config, {"text": f"Status: {msg}"})
+            image = Image.open(io.BytesIO(image_data))
+            image = image.resize((PREVIEW_WIDTH, PREVIEW_HEIGHT), Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(image)
+        except Exception as e:
+            # Could log or print(e) here if debugging
+            return None
 
 if __name__ == "__main__":
     root = tk.Tk()
