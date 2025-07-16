@@ -6,9 +6,8 @@ import os
 import subprocess
 import webbrowser
 from PIL import Image, ImageTk
-import time
 
-# Preview size config
+# Configurable preview size
 PREVIEW_WIDTH = 240
 PREVIEW_HEIGHT = 135
 
@@ -16,22 +15,22 @@ class DupeCheckerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Dupe Checker")
-        
-        # data structures
+
         self.files = []
         self.duplicates = []
         self.preview_index = 0
 
-        # control flags
         self.csv_loading_thread = None
         self.csv_cancelled = False
         self.preview_thread = None
         self.preview_cancelled = False
 
-        # GUI
+        self.preview_images = {}
+
         self.setup_gui()
 
     def setup_gui(self):
+        # Buttons
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
 
@@ -40,27 +39,33 @@ class DupeCheckerApp:
         tk.Button(btn_frame, text="Generate Previews", command=self.generate_previews).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Cancel Image Preview Generation", command=self.cancel_preview_generation).pack(side=tk.LEFT, padx=5)
 
-        columns = ("preview", "name", "path", "size", "duration")
+        # Status labels
+        self.status_label = tk.Label(self.root, text="Status: Ready")
+        self.status_label.pack(pady=5)
+
+        # Treeview
+        columns = ("name", "path", "size", "duration", "preview")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", height=20)
         self.tree.pack(fill=tk.BOTH, expand=True)
 
-        for col in columns:
-            self.tree.heading(col, text=col.capitalize())
-            if col == "preview":
-                self.tree.column(col, width=PREVIEW_WIDTH+20)
-            elif col == "path":
-                self.tree.column(col, width=300)
-            else:
-                self.tree.column(col, width=100)
+        self.tree.heading("name", text="File Name")
+        self.tree.heading("path", text="File Path")
+        self.tree.heading("size", text="Size")
+        self.tree.heading("duration", text="Duration")
+        self.tree.heading("preview", text="Preview")
 
-        # right-click menu
+        self.tree.column("name", width=200)
+        self.tree.column("path", width=300)
+        self.tree.column("size", width=100)
+        self.tree.column("duration", width=100)
+        self.tree.column("preview", width=PREVIEW_WIDTH + 20)
+
+        # Right click menu
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="Open in Explorer", command=self.open_in_explorer)
         self.tree.bind("<Button-3>", self.show_context_menu)
 
-        # for image previews
-        self.preview_images = {}
-
+    # Context menu
     def show_context_menu(self, event):
         iid = self.tree.identify_row(event.y)
         if iid:
@@ -70,18 +75,18 @@ class DupeCheckerApp:
     def open_in_explorer(self):
         selected = self.tree.selection()
         if selected:
-            path = self.tree.item(selected[0], "values")[2]
+            path = self.tree.item(selected[0], "values")[1]
             folder = os.path.dirname(path)
             webbrowser.open(f'file:///{folder}')
 
-    # =================
     # CSV Import
-    # =================
     def import_csv(self):
         file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
         if file_path:
             self.files.clear()
             self.duplicates.clear()
+            self.preview_index = 0
+            self.preview_images.clear()
             self.tree.delete(*self.tree.get_children())
             self.csv_cancelled = False
             self.csv_loading_thread = threading.Thread(target=self.load_csv, args=(file_path,))
@@ -93,6 +98,7 @@ class DupeCheckerApp:
     def load_csv(self, file_path):
         seen_names = set()
         seen_sizes = set()
+        count = 0
         with open(file_path, newline='', encoding='utf-8') as csvfile:
             reader = csv.reader(csvfile)
             for row in reader:
@@ -101,30 +107,23 @@ class DupeCheckerApp:
                 if len(row) < 3:
                     continue
                 name, path, size = row[0].strip(), row[1].strip(), row[2].strip()
+                duration = self.get_duration(path)
                 if name in seen_names or size in seen_sizes:
-                    self.duplicates.append({"name": name, "path": path, "size": size, "duration": "", "preview": None})
-                    self.root.after(0, self.insert_tree_item, name, path, size, "", "")
+                    self.duplicates.append({
+                        "name": name, "path": path, "size": size, "duration": duration, "preview": None
+                    })
+                    self.root.after(0, self.insert_tree_item, name, path, size, duration)
                 seen_names.add(name)
                 seen_sizes.add(size)
-        print("CSV load finished or cancelled.")
+                count += 1
+                if count % 50 == 0:
+                    self.update_status(f"Imported {count} lines...")
+        self.update_status(f"CSV load finished. Total lines checked: {count}")
 
-    def insert_tree_item(self, name, path, size, duration, preview_id):
-        self.tree.insert("", tk.END, values=("", name, path, self.format_size(size), duration))
+    def insert_tree_item(self, name, path, size, duration):
+        self.tree.insert("", tk.END, values=(name, path, self.format_size(size), self.format_duration(duration), ""))
 
-    def format_size(self, size):
-        try:
-            size = int(size)
-            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-                if size < 1024.0:
-                    return f"{size:.2f} {unit}"
-                size /= 1024.0
-            return f"{size:.2f} PB"
-        except:
-            return size
-
-    # =================
     # Preview Generation
-    # =================
     def generate_previews(self):
         if not self.duplicates:
             messagebox.showinfo("Info", "No duplicates loaded.")
@@ -138,28 +137,60 @@ class DupeCheckerApp:
         self.preview_cancelled = True
 
     def _generate_previews(self):
-        while self.preview_index < len(self.duplicates):
+        total = len(self.duplicates)
+        while self.preview_index < total:
             if self.preview_cancelled:
-                print("Preview generation cancelled.")
+                self.update_status(f"Preview generation cancelled at {self.preview_index}/{total}")
                 break
             file = self.duplicates[self.preview_index]
             preview_path = f"preview_{self.preview_index}.jpg"
-            duration = self.get_duration(file["path"])
-            halfway = duration / 2 if duration else 1
+            halfway = float(file["duration"]) / 2 if file["duration"] else 1
             self.extract_frame(file["path"], preview_path, halfway)
-            img = Image.open(preview_path).resize((PREVIEW_WIDTH, PREVIEW_HEIGHT))
-            photo = ImageTk.PhotoImage(img)
-            self.preview_images[self.preview_index] = photo
-            self.update_tree_preview(self.preview_index, photo, duration)
+            try:
+                img = Image.open(preview_path).resize((PREVIEW_WIDTH, PREVIEW_HEIGHT))
+                photo = ImageTk.PhotoImage(img)
+                self.preview_images[self.preview_index] = photo
+                self.root.after(0, self.update_tree_preview, self.preview_index, photo)
+            except:
+                pass
             self.preview_index += 1
+            if self.preview_index % 5 == 0:
+                self.update_status(f"Generated {self.preview_index}/{total} previews")
+        self.update_status("Preview generation completed.")
 
-    def update_tree_preview(self, index, photo, duration):
+    def update_tree_preview(self, index, photo):
         iid = self.tree.get_children()[index]
-        self.tree.item(iid, image=photo, values=("", self.duplicates[index]["name"], 
-                                                self.duplicates[index]["path"], 
-                                                self.format_size(self.duplicates[index]["size"]), 
-                                                self.format_duration(duration)))
-        self.tree.tag_configure(iid, image=photo)
+        self.tree.item(iid, image=photo, values=(
+            self.duplicates[index]["name"],
+            self.duplicates[index]["path"],
+            self.format_size(self.duplicates[index]["size"]),
+            self.format_duration(self.duplicates[index]["duration"]),
+            "✔"
+        ))
+
+    # Utilities
+    def format_size(self, size):
+        try:
+            size = int(size)
+            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                if size < 1024.0:
+                    return f"{size:.2f} {unit}"
+                size /= 1024.0
+            return f"{size:.2f} PB"
+        except:
+            return size
+
+    def format_duration(self, seconds):
+        try:
+            seconds = int(float(seconds))
+            m, s = divmod(seconds, 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h:d}:{m:02d}:{s:02d}"
+            else:
+                return f"{m:02d}:{s:02d}"
+        except:
+            return "0:00"
 
     def get_duration(self, filepath):
         try:
@@ -185,17 +216,8 @@ class DupeCheckerApp:
         except Exception as e:
             print(f"ffmpeg failed: {e}")
 
-    def format_duration(self, seconds):
-        try:
-            seconds = int(seconds)
-            m, s = divmod(seconds, 60)
-            h, m = divmod(m, 60)
-            if h > 0:
-                return f"{h:d}:{m:02d}:{s:02d}"
-            else:
-                return f"{m:02d}:{s:02d}"
-        except:
-            return "0:00"
+    def update_status(self, message):
+        self.root.after(0, self.status_label.config, {"text": f"Status: {message}"})
 
 if __name__ == "__main__":
     root = tk.Tk()
